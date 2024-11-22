@@ -167,96 +167,6 @@ ReshapeScalarFunctionBind(ClientContext &context,
 }
 
 template <typename T>
-void ReshapeScalarInner(const UnifiedVectorFormat &data, idx_t start,
-                        idx_t shape_curr, Vector &result,
-                        const ReshapeScalarFunctionData &function_data) {
-  const auto &shape = function_data.shape;
-  const auto &cumulative_product = function_data.cumulative_product;
-
-  if (shape_curr < shape.size() - 1) {
-    auto &result_output = ArrayVector::GetEntry(result);
-
-    auto child_start = start;
-    for (idx_t i = 0; i < shape[shape_curr]; i++) {
-      ReshapeScalarInner<T>(data, child_start, shape_curr + 1, result_output,
-                            function_data);
-      child_start += cumulative_product[shape_curr];
-    }
-  } else {
-    const auto *data_ptr = UnifiedVectorFormat::GetData<T>(data);
-    const auto &validity = data.validity;
-    const auto &sel = *data.sel;
-
-    auto &result_child = ArrayVector::GetEntry(result);
-    auto *result_data = FlatVector::GetData<T>(result_child);
-    auto &result_validity = FlatVector::Validity(result_child);
-
-    for (idx_t i = 0; i < shape[shape_curr]; i++) {
-      auto child_idx = sel.get_index(start + i);
-      auto target_idx = i;
-      if (validity.RowIsValid(child_idx)) {
-        result_data[start + target_idx] = data_ptr[child_idx];
-        result_validity.SetValid(target_idx);
-      } else {
-        result_validity.SetInvalid(target_idx);
-      }
-    }
-  }
-}
-
-static void
-ReshapeInnerDispatch(const UnifiedVectorFormat &data, idx_t start,
-                     Vector &result,
-                     const ReshapeScalarFunctionData &function_data) {
-  switch (function_data.internal_type.InternalType()) {
-  case PhysicalType::BOOL:
-  case PhysicalType::INT8:
-    ReshapeScalarInner<int8_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::INT16:
-    ReshapeScalarInner<int16_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::INT32:
-    ReshapeScalarInner<int32_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::INT64:
-    ReshapeScalarInner<int64_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::INT128:
-    ReshapeScalarInner<hugeint_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::UINT8:
-    ReshapeScalarInner<uint8_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::UINT16:
-    ReshapeScalarInner<uint16_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::UINT32:
-    ReshapeScalarInner<uint32_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::UINT64:
-    ReshapeScalarInner<uint64_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::UINT128:
-    ReshapeScalarInner<uhugeint_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::FLOAT:
-    ReshapeScalarInner<float>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::DOUBLE:
-    ReshapeScalarInner<double>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::INTERVAL:
-    ReshapeScalarInner<interval_t>(data, start, 0, result, function_data);
-    break;
-  case PhysicalType::VARCHAR:
-    ReshapeScalarInner<string_t>(data, start, 0, result, function_data);
-    break;
-  default:
-    throw InternalException("Unimplemented type for RESHAPE.");
-  }
-}
-
 static void ReshapeScalarFun(DataChunk &args, ExpressionState &state,
                              Vector &result) {
   auto &array_vector = args.data[0];
@@ -294,22 +204,114 @@ static void ReshapeScalarFun(DataChunk &args, ExpressionState &state,
     child_vector.ToUnifiedFormat(args.size(), child_data);
   }
 
-  // Copy the result validity
-  auto &result_validity = FlatVector::Validity(result);
-
-  // Copy the data
-  for (idx_t i = 0; i < args.size(); i++) {
-    ReshapeInnerDispatch(child_data, i * info.num_elements, result, info);
+  // Go into the inner most array
+  Vector *result_output = &ArrayVector::GetEntry(result);
+  for (idx_t i = 1; i < info.shape.size(); i++) {
+    result_output = &ArrayVector::GetEntry(*result_output);
   }
 
-  // Validate the result
+  const auto *child_data_ptr = UnifiedVectorFormat::GetData<T>(child_data);
+  const auto &child_validity = child_data.validity;
+  const auto &child_sel = *child_data.sel;
+  const auto &input_row_validity = vdata.validity;
+  const auto &input_row_sel = *vdata.sel;
+
+  auto *result_data = FlatVector::GetData<T>(*result_output);
+  auto &result_validity = FlatVector::Validity(*result_output);
+
+  auto& top_level_res_validity = FlatVector::Validity(result);
+
+  for (idx_t row_idx = 0; row_idx < args.size(); row_idx++) {
+    // Use vdata to check row validity
+    auto input_row_idx = input_row_sel.get_index(row_idx);
+    if (!input_row_validity.RowIsValid(input_row_idx)) {
+      FlatVector::SetNull(result, row_idx, true);
+      continue;
+    }
+
+    top_level_res_validity.SetValid(row_idx);
+
+    auto element_start_idx = row_idx * info.num_elements;
+    for (idx_t i = element_start_idx; i < element_start_idx + info.num_elements; i++) {
+      auto child_idx = child_sel.get_index(i);
+      if (child_validity.RowIsValid(child_idx)) {
+        result_data[i] = child_data_ptr[child_idx];
+        result_validity.SetValid(i);
+      } else {
+        result_validity.SetInvalid(i);
+      }
+    }
+  }
+
+  // if input is a single element set the output to be a constant vector
+  if (args.size() == 1) {
+    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+  }
+
   result.Verify(args.size());
 }
+
+// Wrapper function to dispatch to appropriate template
+static void ReshapeScalarFunDispatch(DataChunk &args, ExpressionState &state,
+                             Vector &result) {
+  Vector* input_child;
+  if (args.data[0].GetType().id() == LogicalTypeId::LIST) {
+    input_child = &ListVector::GetEntry(args.data[0]);
+  } else {
+    input_child = &ArrayVector::GetEntry(args.data[0]);
+  }
+  switch (input_child->GetType().InternalType()) {
+    case PhysicalType::BOOL:
+    case PhysicalType::INT8:
+      ReshapeScalarFun<int8_t>(args, state, result);
+      break;
+    case PhysicalType::INT16:
+      ReshapeScalarFun<int16_t>(args, state, result);
+      break;
+    case PhysicalType::INT32:
+      ReshapeScalarFun<int32_t>(args, state, result);
+      break;
+    case PhysicalType::INT64:
+      ReshapeScalarFun<int64_t>(args, state, result);
+      break;
+    case PhysicalType::INT128:
+      ReshapeScalarFun<hugeint_t>(args, state, result);
+      break;
+    case PhysicalType::FLOAT:
+      ReshapeScalarFun<float>(args, state, result);
+      break;
+    case PhysicalType::DOUBLE:
+      ReshapeScalarFun<double>(args, state, result);
+      break;
+    case PhysicalType::INTERVAL:
+      ReshapeScalarFun<interval_t>(args, state, result);
+      break;
+    case PhysicalType::UINT8:
+      ReshapeScalarFun<uint8_t>(args, state, result);
+      break;
+    case PhysicalType::UINT16:
+      ReshapeScalarFun<uint16_t>(args, state, result);
+      break;
+    case PhysicalType::UINT32:
+      ReshapeScalarFun<uint32_t>(args, state, result);
+      break;
+    case PhysicalType::UINT64:
+      ReshapeScalarFun<uint64_t>(args, state, result);
+      break;
+    case PhysicalType::UINT128:
+      ReshapeScalarFun<uhugeint_t>(args, state, result);
+      break;
+    default:
+      throw NotImplementedException("Unimplemented type for reshape scalar function");
+  }
+}
+
+
 
 static void LoadInternal(DatabaseInstance &instance) {
   auto scalar_func = ScalarFunction(
       "reshape", {LogicalType::ANY, LogicalType::LIST(LogicalType::INTEGER)},
-      LogicalType::ANY, ReshapeScalarFun, ReshapeScalarFunctionBind);
+      LogicalType::ANY, ReshapeScalarFunDispatch, ReshapeScalarFunctionBind);
   scalar_func.varargs = LogicalType::INTEGER;
   ExtensionUtil::RegisterFunction(instance, scalar_func);
 }
