@@ -1,0 +1,23 @@
+# name: test/sql/reshape.test
+# description: test reshape extension
+# group: [reshape]
+
+# Before we load the extension, this will fail
+statement error
+SELECT reshape([1, 2, 3, 4], [2, 2]);
+----
+Catalog Error: Scalar Function with name reshape does not exist!
+
+# Require statement will ensure this test is run with this extension loaded
+require reshape
+
+# Confirm the extension works
+query I
+SELECT reshape([1, 2, 3, 4], [2, 2], 4);
+----
+[[1, 2], [3, 4]]
+
+query I
+SELECT reshape([1, 2, 3, 4]::INTEGER[4], [2, 2]);
+----
+[[1, 2], [3, 4]]
